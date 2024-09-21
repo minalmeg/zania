@@ -6,6 +6,7 @@ import logging
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from flask import Flask, request, jsonify
+from rag_processor import process_pdf_and_questions
 
 app = Flask(__name__)
 
@@ -16,7 +17,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler()  # This will keep printing to console too, can be removed if you only want file
+        # logging.StreamHandler()  # This will keep printing to console too, can be removed if you only want file
     ]
 )
 
@@ -179,8 +180,11 @@ def handle_file_upload(event):
         # Download the file, rename it, and save it in the Dataset/user_data folder
         file_path = download_file(file_url, headers, original_file_name, user_text)
 
+        response = process_pdf_and_questions(file_path, user_text)
+        print(response)
         if file_path:
             post_to_slack(f"File received and saved: {file_type}", channel_id)
+            post_to_slack(f"Answer: {response}", channel_id)
         else:
             post_to_slack("File could not be saved.", channel_id)
 
