@@ -151,7 +151,6 @@ def handle_file_upload(event):
     try:
         # Check if 'files' are present in the event
         if 'files' not in event or not event['files']:
-            # No file attached, post message to Slack and stop further processing
             channel_id = event.get('channel')
             post_to_slack("Please attach a PDF file.", channel_id)
             return
@@ -164,7 +163,7 @@ def handle_file_upload(event):
 
         headers = {"Authorization": f"Bearer {bot_oauth_token}"}
 
-        # Check if the file is a PDF, otherwise return an error message and stop further processing
+        # Check if the file is a PDF
         if file_type != 'application/pdf':
             post_to_slack("Only PDF files are accepted. Please upload a PDF.", channel_id)
             return
@@ -172,27 +171,36 @@ def handle_file_upload(event):
         # Extract user text from event
         user_text = extract_text_from_event(event)
 
-        # Check if the CSV already contains this file and text
+        # Check if it's a duplicate
         if is_duplicate_entry(original_file_name, user_text):
             logging.info(f"Duplicate entry detected: {original_file_name}, {user_text}")
             return
 
-        # Download the file, rename it, and save it in the Dataset/user_data folder
+        # Download the file
         file_path = download_file(file_url, headers, original_file_name, user_text)
 
-        response = process_pdf_and_questions(file_path, user_text)
-        print(response)
-        if file_path:
-            post_to_slack(f"File received and saved: {file_type}", channel_id)
-            post_to_slack(f"Answer: {response}", channel_id)
-        else:
+        # Ensure the file path exists before proceeding
+        if not file_path:
             post_to_slack("File could not be saved.", channel_id)
+            return
 
-        logging.info(f"File uploaded: {file_url} (type: {file_type})")
+        # Start RAG process to handle the PDF and answer questions
+        logging.info("Starting RAG process")
+
+        logging.info("No duplicate detected. Starting RAG process.")
+        response = process_pdf_and_questions(file_path, user_text, config_file_path)
+        logging.info(f"RAG process response: {response}")
+
+
+        # Post results to Slack
+        post_to_slack(f"File received and saved: {original_file_name}", channel_id)
+        post_to_slack(f"Answer: {response}", channel_id)
+
     except SlackApiError as e:
         logging.error(f"Error handling file upload: {e.response['error']}")
     except Exception as e:
         logging.error(f"Error in file handling: {e}")
+
 
 
 def is_duplicate_entry(original_name, user_text):
@@ -202,7 +210,7 @@ def is_duplicate_entry(original_name, user_text):
             reader = csv.reader(csv_file)
             for row in reader:
                 if len(row) >= 3 and row[0] == original_name and row[2] == user_text:
-                    return True
+                    return False
     except FileNotFoundError:
         logging.warning("CSV file not found when checking for duplicates.")
     return False
