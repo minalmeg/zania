@@ -4,6 +4,7 @@ import openai
 import faiss
 import numpy as np
 import json
+import spacy
 
 # Configure logging to write to a file called RAG_logging.log
 logging.basicConfig(
@@ -14,6 +15,9 @@ logging.basicConfig(
         logging.StreamHandler()  # Optional: Log to console as well
     ]
 )
+
+# Load spaCy NER model
+nlp = spacy.load("en_core_web_sm")
 
 # Load configuration file to get the OpenAI API key and other credentials
 def load_config(file_path):
@@ -33,6 +37,15 @@ def extract_text_from_pdf(pdf_file_path):
         text += page.get_text()
         logging.debug(f"Extracted text from page {page_num}")
     return text
+
+# Extract Named Entities from the text
+def extract_named_entities(text):
+    """Uses spaCy to extract named entities from the text."""
+    logging.info("Extracting named entities from the text")
+    doc = nlp(text)
+    entities = {ent.label_: ent.text for ent in doc.ents}
+    logging.info(f"Named entities found: {entities}")
+    return entities
 
 # Text Chunking for LLM token limit
 def chunk_text(text, chunk_size=2000):
@@ -72,13 +85,18 @@ def create_faiss_index(embeddings):
     logging.info(f"FAISS index created with {len(embeddings)} embeddings")
     return index
 
-# Retrieve relevant chunks based on question
-def retrieve_relevant_chunks(question, index, text_chunks, api_key):
-    """Retrieve the most relevant text chunks using FAISS and embeddings."""
+# Retrieve relevant chunks based on question and extracted entities
+def retrieve_relevant_chunks(question, index, text_chunks, entities, api_key):
+    """Retrieve the most relevant text chunks using FAISS, embeddings, and extracted entities."""
     logging.info(f"Retrieving relevant chunks for question: {question}")
     openai.api_key = api_key
+    
+    # Combine entities into the question if relevant
+    enriched_question = f"{question} related to {entities.get('ORG', '') or 'the document'}"
+    
+    # Generate question embeddings
     response = openai.Embedding.create(
-        input=question,
+        input=enriched_question,
         model="text-embedding-ada-002"
     )
     question_embedding = response['data'][0]['embedding']
@@ -88,52 +106,34 @@ def retrieve_relevant_chunks(question, index, text_chunks, api_key):
     logging.info(f"Retrieved top {len(I[0])} relevant chunks for question")
     return [text_chunks[i] for i in I[0]]
 
-# LLM-based Answer Generation using OpenAI GPT-4o-mini
-def get_answer_from_llm(retrieved_chunks, question, model="gpt-4o-mini"):
+# LLM-based Answer Generation using OpenAI GPT-3.5-turbo (free/low-cost option)
+def get_answer_from_llm(retrieved_chunks, question, model="gpt-3.5-turbo"):
     """Generate an answer using LLM and retrieved chunks."""
     logging.info(f"Generating answer for question: {question}")
     context = " ".join(retrieved_chunks)
     prompt = f"Based on the following context, answer the question: {question}\n\nContext: {context}"
-    response = openai.Completion.create(
-        engine=model,
-        prompt=prompt,
+
+    # Using gpt-3.5-turbo for completion (cost-effective)
+    response = openai.ChatCompletion.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
         max_tokens=150,
         temperature=0.7,
         top_p=1,
         frequency_penalty=0,
         presence_penalty=0
     )
-    logging.info("Generated answer using LLM")
-    return response.choices[0].text.strip()
 
-# # LLM-based Answer Generation using OpenAI GPT-3.5-turbo (free/low-cost option)
-# def get_answer_from_llm(retrieved_chunks, question, model="gpt-3.5-turbo"):
-#     """Generate an answer using LLM and retrieved chunks."""
-#     logging.info(f"Generating answer for question: {question}")
-#     context = " ".join(retrieved_chunks)
-#     prompt = f"Based on the following context, answer the question: {question}\n\nContext: {context}"
-
-#     # Using gpt-3.5-turbo for completion (cost-effective)
-#     response = openai.ChatCompletion.create(
-#         model=model,
-#         messages=[
-#             {"role": "system", "content": "You are a helpful assistant."},
-#             {"role": "user", "content": prompt}
-#         ],
-#         max_tokens=150,
-#         temperature=0.7,
-#         top_p=1,
-#         frequency_penalty=0,
-#         presence_penalty=0
-#     )
-
-#     logging.info("Generated answer using GPT-3.5-turbo")
-#     return response['choices'][0]['message']['content'].strip()
+    logging.info("Generated answer using GPT-3.5-turbo")
+    return response['choices'][0]['message']['content'].strip()
 
 
-# Main function that processes the PDF and answers the questions
+# Main function that processes the PDF and answers the questions using the hybrid approach
 def process_pdf_and_questions(pdf_path, questions, config_file):
-    """Processes the PDF, chunks the text, generates embeddings, and answers questions."""
+    """Processes the PDF, extracts named entities, chunks the text, generates embeddings, and answers questions."""
     logging.info(f"Processing PDF: {pdf_path}")
     
     # Load the configuration (including OpenAI API key) from the config file
@@ -143,21 +143,25 @@ def process_pdf_and_questions(pdf_path, questions, config_file):
     # Step 1: Extract text from the PDF
     pdf_text = extract_text_from_pdf(pdf_path)
 
-    # Step 2: Split the text into chunks
+    # Step 2: Extract named entities (e.g., company names, policies)
+    named_entities = extract_named_entities(pdf_text)
+
+    # Step 3: Split the text into chunks
     text_chunks = chunk_text(pdf_text)
 
-    # Step 3: Generate embeddings for each chunk
+    # Step 4: Generate embeddings for each chunk
     embeddings = generate_embeddings(text_chunks, openai_api_key)
 
-    # Step 4: Create FAISS index for chunk embeddings
+    # Step 5: Create FAISS index for chunk embeddings
     faiss_index = create_faiss_index(embeddings)
 
-    # Step 5: Prepare answers for each question
+    # Step 6: Prepare answers for each question
     answers = []
     for question in questions:
         logging.info(f"Processing question: {question}")
-        # Retrieve relevant chunks for each question
-        relevant_chunks = retrieve_relevant_chunks(question, faiss_index, text_chunks, openai_api_key)
+        
+        # Retrieve relevant chunks for each question based on both the embeddings and extracted entities
+        relevant_chunks = retrieve_relevant_chunks(question, faiss_index, text_chunks, named_entities, openai_api_key)
         
         # Generate an answer from the relevant chunks
         answer = get_answer_from_llm(relevant_chunks, question)
