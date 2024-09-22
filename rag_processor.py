@@ -1,25 +1,27 @@
 import logging
 import fitz  # PyMuPDF for PDF extraction
-import openai
-import faiss
-import numpy as np
-import json
+from langchain_community.chat_models import ChatOpenAI
+from langchain.vectorstores import FAISS
+from langchain.embeddings.openai import OpenAIEmbeddings
 import spacy
+import json
+import openai
+import re
 
-# Configure logging to write to a file called RAG_logging.log
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("RAG_logging.log"),  # Log to file
-        logging.StreamHandler()  # Optional: Log to console as well
+        # logging.StreamHandler()  # Optional: Log to console as well
     ]
 )
 
 # Load spaCy NER model
 nlp = spacy.load("en_core_web_sm")
 
-# Load configuration file to get the OpenAI API key and other credentials
+# Function to load configuration
 def load_config(file_path):
     """Loads the configuration from a JSON file."""
     logging.info(f"Loading configuration from {file_path}")
@@ -27,18 +29,20 @@ def load_config(file_path):
         config = json.load(file)
     return config
 
-# PDF Text Extraction
-def extract_text_from_pdf(pdf_file_path):
+# Function to extract text from PDF (with optional page limit)
+def extract_text_from_pdf(pdf_file_path, page_limit=None):
     """Extracts text from a PDF file."""
     logging.info(f"Extracting text from PDF: {pdf_file_path}")
     doc = fitz.open(pdf_file_path)
     text = ""
     for page_num, page in enumerate(doc, start=1):
+        if page_limit and page_num > page_limit:
+            break
         text += page.get_text()
         logging.debug(f"Extracted text from page {page_num}")
     return text
 
-# Extract Named Entities from the text
+# Function to extract named entities using spaCy
 def extract_named_entities(text):
     """Uses spaCy to extract named entities from the text."""
     logging.info("Extracting named entities from the text")
@@ -47,7 +51,7 @@ def extract_named_entities(text):
     logging.info(f"Named entities found: {entities}")
     return entities
 
-# Text Chunking for LLM token limit
+# Function to chunk the text for LLM token limits
 def chunk_text(text, chunk_size=2000):
     """Splits the text into chunks within the token limit of LLM."""
     logging.info("Chunking text into smaller pieces")
@@ -59,63 +63,56 @@ def chunk_text(text, chunk_size=2000):
     logging.info(f"Text has been split into {len(chunks)} chunks")
     return chunks
 
-# Generate embeddings using OpenAI's embedding model
-def generate_embeddings(text_chunks, api_key):
-    """Generate embeddings for text chunks using OpenAI API."""
-    logging.info("Generating embeddings for text chunks")
-    openai.api_key = api_key
-    embeddings = []
-    for i, chunk in enumerate(text_chunks, start=1):
-        response = openai.Embedding.create(
-            input=chunk,
-            model="text-embedding-ada-002"  # Low cost OpenAI embedding model
-        )
-        embeddings.append(response['data'][0]['embedding'])
-        logging.debug(f"Generated embedding for chunk {i}/{len(text_chunks)}")
-    logging.info("Generated embeddings for all text chunks")
-    return embeddings
-
-# Store embeddings in FAISS vector database
-def create_faiss_index(embeddings):
-    """Creates a FAISS index for embedding vectors."""
+# Function to create FAISS index
+def create_faiss_index(text_chunks, api_key):
+    """Creates FAISS index from text chunks using OpenAI embeddings."""
     logging.info("Creating FAISS index for embeddings")
-    dimension = len(embeddings[0])
-    index = faiss.IndexFlatL2(dimension)  # L2 distance
-    index.add(np.array(embeddings, dtype=np.float32))
-    logging.info(f"FAISS index created with {len(embeddings)} embeddings")
-    return index
 
-# Retrieve relevant chunks based on question and extracted entities
-def retrieve_relevant_chunks(question, index, text_chunks, entities, api_key):
-    """Retrieve the most relevant text chunks using FAISS, embeddings, and extracted entities."""
-    logging.info(f"Retrieving relevant chunks for question: {question}")
-    openai.api_key = api_key
+    # Initialize OpenAIEmbeddings with the API key
+    embedding_model = OpenAIEmbeddings(openai_api_key=api_key)
+
+    # Generate embeddings for the text chunks
+    embeddings = [embedding_model.embed_query(chunk) for chunk in text_chunks]
     
-    # Combine entities into the question if relevant
-    enriched_question = f"{question} related to {entities.get('ORG', '') or 'the document'}"
+    # Create FAISS index using the generated embeddings
+    faiss_index = FAISS.from_texts(text_chunks, embedding_model)
+
+    logging.info(f"FAISS index created with {len(text_chunks)} chunks")
+    return faiss_index
+
+# Function to prioritize chunks based on index
+def use_index_to_guide_retrieval(text_chunks, index_text):
+    """Processes the index from the first few pages and returns prioritized text chunks."""
+    logging.info("Processing index to guide retrieval.")
     
-    # Generate question embeddings
-    response = openai.Embedding.create(
-        input=enriched_question,
-        model="text-embedding-ada-002"
-    )
-    question_embedding = response['data'][0]['embedding']
+    prioritized_chunks = []
+    for chunk in text_chunks:
+        if any(keyword.lower() in chunk.lower() for keyword in index_text.split()):
+            prioritized_chunks.append(chunk)
+    
+    logging.info(f"Prioritized {len(prioritized_chunks)} chunks based on index.")
+    
+    if len(prioritized_chunks) == 0:
+        logging.warning("No prioritized chunks found, returning original chunks.")
+        return text_chunks
+    
+    return prioritized_chunks
 
-    # Search for the most relevant chunks
-    D, I = index.search(np.array([question_embedding], dtype=np.float32), k=3)  # k is the number of top results
-    logging.info(f"Retrieved top {len(I[0])} relevant chunks for question")
-    return [text_chunks[i] for i in I[0]]
-
-# LLM-based Answer Generation using OpenAI GPT-3.5-turbo (free/low-cost option)
-def get_answer_from_llm(retrieved_chunks, question, model="gpt-3.5-turbo"):
-    """Generate an answer using LLM and retrieved chunks."""
+# Function to generate a custom answer
+def generate_custom_answer(question, retrieved_chunks, openai_api_key, llm_model="gpt-3.5-turbo"):
+    """Generates an answer by passing the retrieved chunks and question to the OpenAI model."""
     logging.info(f"Generating answer for question: {question}")
-    context = " ".join(retrieved_chunks)
+    
+    # Extract the text from each retrieved chunk (Document objects)
+    context = " ".join([doc.page_content for doc in retrieved_chunks])  # Extracting 'page_content' from Document objects
+
+    # Create the prompt with the extracted text as context
     prompt = f"Based on the following context, answer the question: {question}\n\nContext: {context}"
 
-    # Using gpt-3.5-turbo for completion (cost-effective)
+    # Make the call to OpenAI's completion API
+    openai.api_key = openai_api_key
     response = openai.ChatCompletion.create(
-        model=model,
+        model=llm_model,
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": prompt}
@@ -126,53 +123,79 @@ def get_answer_from_llm(retrieved_chunks, question, model="gpt-3.5-turbo"):
         frequency_penalty=0,
         presence_penalty=0
     )
+    
+    answer = response['choices'][0]['message']['content'].strip()
+    logging.info(f"Generated answer: {answer}")
+    
+    return answer
 
-    logging.info("Generated answer using GPT-3.5-turbo")
-    return response['choices'][0]['message']['content'].strip()
+# Function to extract valid questions using regex
+def extract_questions(text):
+    """Extracts complete questions using a regex pattern."""
+    logging.info("Extracting questions from the input text.")
+    
+    # Regex pattern to match questions starting with a number followed by a period
+    pattern = r"\d+\.\s.+?(?=\d+\.|$)"
+    
+    # Find all matches in the input text
+    questions = re.findall(pattern, text, re.DOTALL)
+    
+    logging.info(f"Extracted {len(questions)} questions.")
+    return questions
 
-
-# Main function that processes the PDF and answers the questions using the hybrid approach
-def process_pdf_and_questions(pdf_path, questions, config_file):
-    """Processes the PDF, extracts named entities, chunks the text, generates embeddings, and answers questions."""
+# Main function to process PDF and answer questions
+def process_pdf_and_questions(pdf_path, questions_text, config_file):
+    """
+    Processes the PDF, extracts named entities, chunks the text,
+    generates embeddings, and answers each question separately.
+    """
     logging.info(f"Processing PDF: {pdf_path}")
     
-    # Load the configuration (including OpenAI API key) from the config file
+    # Load configuration (including OpenAI API key)
     config = load_config(config_file)
-    openai_api_key = config["openai"]["api_key"]  # Extract OpenAI API key from the loaded config
-
-    # Step 1: Extract text from the PDF
+    openai_api_key = config["openai"]["api_key"]
+    
+    if not openai_api_key:
+        raise ValueError("OpenAI API key not found in the configuration file.")
+    
+    # Extract index from the first two pages of the PDF
+    index_text = extract_text_from_pdf(pdf_path, page_limit=2)
+    
+    # Extract full text from the PDF
     pdf_text = extract_text_from_pdf(pdf_path)
-
-    # Step 2: Extract named entities (e.g., company names, policies)
+    
+    # Extract named entities
     named_entities = extract_named_entities(pdf_text)
 
-    # Step 3: Split the text into chunks
+    # Split the text into chunks
     text_chunks = chunk_text(pdf_text)
 
-    # Step 4: Generate embeddings for each chunk
-    embeddings = generate_embeddings(text_chunks, openai_api_key)
+    # Prioritize text chunks using the index
+    prioritized_chunks = use_index_to_guide_retrieval(text_chunks, index_text)
+    
+    # Create FAISS index
+    vectorstore = create_faiss_index(prioritized_chunks, openai_api_key)
 
-    # Step 5: Create FAISS index for chunk embeddings
-    faiss_index = create_faiss_index(embeddings)
+    # Extract complete questions using regex
+    questions = extract_questions(questions_text)
 
-    # Step 6: Prepare answers for each question
+    # Answer each question
     answers = []
     for question in questions:
         logging.info(f"Processing question: {question}")
         
-        # Retrieve relevant chunks for each question based on both the embeddings and extracted entities
-        relevant_chunks = retrieve_relevant_chunks(question, faiss_index, text_chunks, named_entities, openai_api_key)
-        
-        # Generate an answer from the relevant chunks
-        answer = get_answer_from_llm(relevant_chunks, question)
+        # Retrieve the most relevant chunks
+        retrieved_chunks = vectorstore.similarity_search(question, k=3)
+
+        # Generate an answer from the retrieved chunks
+        answer = generate_custom_answer(question, retrieved_chunks, openai_api_key=openai_api_key)
         
         # If the answer is too short, assume low confidence and return "Data Not Available"
         if len(answer) < 20:
             logging.warning(f"Answer too short for question: {question}. Returning 'Data Not Available'")
             answer = "Data Not Available"
-
+        
         answers.append(answer)
 
     logging.info("Finished processing all questions")
-    # Return the generated answers
     return answers
