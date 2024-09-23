@@ -1,1 +1,4 @@
-*_key.txt
+config.json
+logs/
+Dataset/user_data
+envs/
