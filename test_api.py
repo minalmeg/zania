@@ -146,16 +146,25 @@ def handle_message(event):
     except Exception as e:
         logging.error(f"Error handling message: {e}")
 
+processed_events = set()  # To store processed event IDs
+
 def handle_file_upload(event):
     """Handles file upload events, checks file type, and acknowledges the upload."""
     try:
-        # Check if 'files' are present in the event
-        if 'files' not in event or not event['files']:
-            channel_id = event.get('channel')
-            post_to_slack("Please attach a PDF file.", channel_id)
+        event_id = event.get('event_id')
+        file_info = event['files'][0]  # Access the first file info
+        file_id = file_info['id']  # Unique file ID
+
+        # Check if the event or file has already been processed
+        if event_id in processed_events or file_id in processed_events:
+            logging.info(f"Event {event_id} or File {file_id} already processed. Skipping.")
             return
 
-        file_info = event['files'][0]  # Access the first file info (if multiple files, handle the first)
+        # Mark the event and file as processed
+        processed_events.add(event_id)
+        processed_events.add(file_id)
+
+        # Proceed with file handling
         file_url = file_info['url_private']
         original_file_name = file_info['name']
         file_type = file_info['mimetype']
@@ -171,11 +180,6 @@ def handle_file_upload(event):
         # Extract user text from event
         user_text = extract_text_from_event(event)
 
-        # Check if it's a duplicate
-        if is_duplicate_entry(original_file_name, user_text):
-            logging.info(f"Duplicate entry detected: {original_file_name}, {user_text}")
-            return
-
         # Download the file
         file_path = download_file(file_url, headers, original_file_name, user_text)
 
@@ -186,15 +190,15 @@ def handle_file_upload(event):
 
         # Start RAG process to handle the PDF and answer questions
         logging.info("Starting RAG process")
-
-        logging.info("No duplicate detected. Starting RAG process.")
         response = process_pdf_and_questions(file_path, user_text, config_file_path)
         logging.info(f"RAG process response: {response}")
-
 
         # Post results to Slack
         post_to_slack(f"File received and saved: {original_file_name}", channel_id)
         post_to_slack(f"Answer: {response}", channel_id)
+
+        # Ensure to log when the process is completed
+        logging.info(f"Processing completed for event {event_id} and file {file_id}. Waiting for the next event.")
 
     except SlackApiError as e:
         logging.error(f"Error handling file upload: {e.response['error']}")
