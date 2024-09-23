@@ -11,13 +11,12 @@ from rag_processor import process_pdf_and_questions
 app = Flask(__name__)
 
 # Set up logging to a file
-log_file = "slack_logging.log"
+log_file = "logs/slack_logging.log"
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(log_file),
-        # logging.StreamHandler()  # This will keep printing to console too, can be removed if you only want file
     ]
 )
 
@@ -44,6 +43,12 @@ bot_user_id = client.auth_test()["user_id"]
 # CSV file to maintain original and new file names and user text
 csv_file_path = "Dataset/user_data/file_mapping.csv"
 
+# Track processed events in memory
+processed_events = set()
+
+# File to persist processed events for restarts
+processed_events_file = "processed_events.txt"
+
 def initialize_csv_file():
     """Initializes the CSV file if it doesn't exist."""
     if not os.path.exists(csv_file_path):
@@ -58,6 +63,19 @@ def update_csv_file(original_name, new_name, user_text):
         writer = csv.writer(csv_file)
         writer.writerow([original_name, new_name, user_text])
     logging.info(f"File mapping updated: {original_name} -> {new_name}, with text: {user_text}")
+
+def load_processed_events():
+    """Loads the processed events from file to memory."""
+    if os.path.exists(processed_events_file):
+        with open(processed_events_file, 'r') as f:
+            for line in f:
+                processed_events.add(line.strip())
+
+def save_processed_event(event_id):
+    """Saves a processed event ID to file and memory."""
+    processed_events.add(event_id)
+    with open(processed_events_file, 'a') as f:
+        f.write(f"{event_id}\n")
 
 # Function to get the next available file number
 def get_next_file_number(save_dir):
@@ -104,7 +122,7 @@ def download_file(file_url, headers, original_name, user_text):
     try:
         response = requests.get(file_url, headers=headers)
 
-        # Create the directory if it does not exist
+        # Create the directory if it doesn't exist
         save_dir = "Dataset/user_data"
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -146,23 +164,26 @@ def handle_message(event):
     except Exception as e:
         logging.error(f"Error handling message: {e}")
 
-processed_events = set()  # To store processed event IDs
-
 def handle_file_upload(event):
     """Handles file upload events, checks file type, and acknowledges the upload."""
     try:
-        event_id = event.get('event_id')
+        # Slack events can sometimes not contain 'event_id', so we use 'client_msg_id' as an alternative
+        event_id = event.get('event_id') or event.get('client_msg_id')
         file_info = event['files'][0]  # Access the first file info
-        file_id = file_info['id']  # Unique file ID
+        file_id = file_info.get('id')  # Unique file ID
 
-        # Check if the event or file has already been processed
-        if event_id in processed_events or file_id in processed_events:
-            logging.info(f"Event {event_id} or File {file_id} already processed. Skipping.")
+        # Check if file_id exists
+        if not file_id:
+            logging.error(f"File ID missing in event. Skipping. Event details: {event}")
             return
 
-        # Mark the event and file as processed
-        processed_events.add(event_id)
-        processed_events.add(file_id)
+        # Check if the event or file has already been processed
+        if file_id in processed_events:
+            logging.info(f"File {file_id} already processed. Skipping.")
+            return
+
+        # Mark the file as processed to avoid duplication
+        save_processed_event(file_id)
 
         # Proceed with file handling
         file_url = file_info['url_private']
@@ -197,27 +218,13 @@ def handle_file_upload(event):
         post_to_slack(f"File received and saved: {original_file_name}", channel_id)
         post_to_slack(f"Answer: {response}", channel_id)
 
-        # Ensure to log when the process is completed
-        logging.info(f"Processing completed for event {event_id} and file {file_id}. Waiting for the next event.")
+        # Log completion of processing
+        logging.info(f"Processing completed for file {file_id}. Waiting for the next event.")
 
     except SlackApiError as e:
         logging.error(f"Error handling file upload: {e.response['error']}")
     except Exception as e:
         logging.error(f"Error in file handling: {e}")
-
-
-
-def is_duplicate_entry(original_name, user_text):
-    """Checks if the combination of original_name and user_text already exists in the CSV."""
-    try:
-        with open(csv_file_path, 'r') as csv_file:
-            reader = csv.reader(csv_file)
-            for row in reader:
-                if len(row) >= 3 and row[0] == original_name and row[2] == user_text:
-                    return False
-    except FileNotFoundError:
-        logging.warning("CSV file not found when checking for duplicates.")
-    return False
 
 @app.route('/slack/events', methods=['GET', 'POST'])
 def slack_events():
@@ -251,6 +258,10 @@ def slack_events():
 
 # Start the Flask server
 if __name__ == "__main__":
+    # Load processed events from file
+    load_processed_events()
+
     # Ensure CSV file exists
     initialize_csv_file()
+
     app.run(port=8080)
